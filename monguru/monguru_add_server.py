@@ -5,6 +5,10 @@ import subprocess
 import json
 import getpass
 import socket
+import random
+import string
+import traceback
+import os
 
 sys.path.append('/tmp/monguru')
 
@@ -99,6 +103,25 @@ def query_custom_answers(question, answers, default=None):
             return answer_from_valid_choice[choice]
         else:
             sys.stdout.write("\n"+admonishment+"\n\n\n")
+def configure_snmpd(snmp_login, snmp_password):
+    snmp_files = ['/var/lib/snmp/snmpd.conf']
+    snmp_config_file = '/etc/snmp/snmpd.conf'
+
+    f_snmp_config_file = open(snmp_config_file, 'a')
+    f_snmp_config_file.write('rouser    %s  priv -V systemonly\n' % snmp_login)
+
+    for f in snmp_files:
+        if os.path.isfile(f):
+            os.system('/etc/init.d/snmpd stop')
+            cfile = open(f, 'a')
+            cfile.write('createUser %s SHA1 "%s" AES\n' % (
+                snmp_login, snmp_password))
+            cfile.write('rouser %s\n' % snmp_login)
+            cfile.close()
+            os.system('/etc/init.d/snmpd start')
+            return True
+    return False
+
 
 def connected_ports(ip, port):
     print "-Testing port connetion from the internet to %s:%s..." % (ip, port),
@@ -119,10 +142,15 @@ def connected_ports(ip, port):
 
 
 def create_instance(username, password, auth_cookie):
+    snmp_login = ''.join(random.choice(string.ascii_lowercase
+        ) for x in range(16))
+    snmp_password = ''.join(random.choice(string.ascii_letters +
+        string.digits) for x in range(16))
     data = {
                 'friendly_name': 'My First Instance',
                 'fqdn': '',
-                'userslist': '%s:%s' % (username, password)
+                'userslist': '%s:%s' % (username, password),
+                'snmp_auth_cred': '%s:%s' % (snmp_login, snmp_password)
             }
     r = requests.post(MONGURU_BASE_URL+'/nagiosv3/create_instance/', data=data, cookies=auth_cookie, verify=False)
     return r.json()
@@ -160,7 +188,7 @@ def snmp_me(address, login, password):
     return r.json()['snmp']
 
 
-def get_infos(snmp_login, snmp_password):
+def get_infos():
 
     print "-Trying to get server ip address...",
     my_ip = find_my_ip()
@@ -170,7 +198,7 @@ def get_infos(snmp_login, snmp_password):
     if correct_found_ip == YES_NO[1]:
         my_ip = raw_input('-Please enter the host (FQDN) or IP to use as address: ')
     if not ping_me(my_ip):
-        print "*** ERROR ***: Sorry, MonGuru server cannot ping your address %s, is ICMP reply (type 0) open on firewall ?" % my_ip
+        print "*** ERROR ***: Sorry, MonGuru server cannot ping your address %s. Is ICMP reply (type 0) open on firewall ?" % my_ip
         sys.exit(3)
 
     hostname = socket.gethostname()
@@ -179,13 +207,59 @@ def get_infos(snmp_login, snmp_password):
     if correct_found_hostname == YES_NO[1]:
             hostname = raw_input('-Please enter the host name to identify this host in Nagios: ')
 
-    if not snmp_me(my_ip, snmp_login, snmp_password):
-        print "*** ERROR ***: Sorry, MonGuru server cannot connect via snmp to address %s is udp port 161 (snmp) open on firewall ?" % my_ip
-        sys.exit(3)
-
-
     process_list = subprocess.Popen(['ps', '-Aofname'],
             stdout=subprocess.PIPE).communicate()[0].splitlines()
+
+
+    email = raw_input('''Enter the MonGuru login (email), if you don't have one, create at %s: ''' % MONGURU_BASE_URL)
+    password = getpass.getpass('Password: ')
+    print "-Authenticating...",
+    new = False
+    url = MONGURU_BASE_URL+'/login/'
+    r = requests.get(url, verify=False)
+    print "done."
+    csrftoken = r.cookies['csrftoken']
+    payload = {'username': email, 'password': password, 'csrfmiddlewaretoken': csrftoken}
+    cookies = {'csrftoken':csrftoken}
+    headers = {'Referer': url}
+    r = requests.post(url, cookies=cookies, data=payload, headers=headers, verify=False)
+    cookies_list = r.request.headers['Cookie'].split()
+    session_id = ''
+    for c in cookies_list:
+        if c.startswith('sessionid='):
+            session_id = c.split('=')[1].replace(';', '')
+            break
+    cookies['sessionid'] = session_id
+    print "-Searching for instances...",
+    instances = requests.get(MONGURU_BASE_URL+'/nagiosv3/list_instances/', cookies=cookies, verify=False).json()
+    print "done."
+
+
+    #TODO: ask which instance to use
+    if instances:
+        instance = instances[0]
+    else:
+        print "-No instance found. Creating one...",
+        new = True
+        instance = create_instance(email, password, cookies)
+        print "done."
+
+    snmp_login = instance['snmp_auth_cred'].split(':')[0]
+    snmp_password = instance['snmp_auth_cred'].split(':')[1]
+    if not snmp_login or not snmp_password:
+        print "*** ERROR ***: Compatibility only new Nagios instances will work with this script..."
+        print "Trying to backup your current instance config files, and then removing it"
+        print "You can sent an e-mail to help@mongu.ru"
+        print "Finished with ERROR!"
+        sys.exit(3)
+
+    if not configure_snmpd(snmp_login, snmp_password):
+        print "*** ERROR ***: Sorry, Cannot configure snmpd..."
+        sys.exit(3)
+
+    if not snmp_me(my_ip, snmp_login, snmp_password):
+        print "*** ERROR ***: Sorry, MonGuru server cannot connect via snmp to address %s. Is udp port 161 (snmp) open on firewall ?" % my_ip
+        sys.exit(3)
 
     for service in SERVICES:
         c_command = SERVICES[service]['check_command'] % (snmp_login, snmp_password)
@@ -244,39 +318,6 @@ def get_infos(snmp_login, snmp_password):
             'services': SERVICES,
           }
 
-    email = raw_input('''Enter the MonGuru login (email), if you don't have one, create at %s: ''' % MONGURU_BASE_URL)
-    password = getpass.getpass('Password: ')
-    print "-Authenticating...",
-    new = False
-    url = MONGURU_BASE_URL+'/login/'
-    r = requests.get(url, verify=False)
-    print "done."
-    csrftoken = r.cookies['csrftoken']
-    payload = {'username': email, 'password': password, 'csrfmiddlewaretoken': csrftoken}
-    cookies = {'csrftoken':csrftoken}
-    headers = {'Referer': url}
-    r = requests.post(url, cookies=cookies, data=payload, headers=headers, verify=False)
-    cookies_list = r.request.headers['Cookie'].split()
-    session_id = ''
-    for c in cookies_list:
-        if c.startswith('sessionid='):
-            session_id = c.split('=')[1].replace(';', '')
-            break
-    cookies['sessionid'] = session_id
-    print "-Searching for instances...",
-    instances = requests.get(MONGURU_BASE_URL+'/nagiosv3/list_instances/', cookies=cookies, verify=False).json()
-    print "done."
-
-
-    #TODO: ask which instance to use
-    if instances:
-        instance = instances[0]
-    else:
-        print "-No instance found. Creating one...",
-        new = True
-        instance = create_instance(email, password, cookies)
-        print "done."
-
 
     print "-Adding this server to Nagios...",
     config_cursor = get_config_cursor(instance['instance_key'], cookies)
@@ -292,11 +333,12 @@ def get_infos(snmp_login, snmp_password):
     if new:
         print '-Use your email as login (%s)' % email
     print '*** Please *** visit the url %s to see it' % instance['instance_url']
-    print "-Don't know Nagios ? Visit http://wiki.monguru/wiki/Basic_Nagios"
+    print "-Don't know Nagios ? Visit http://wiki.mongu.ru/wiki/Basic_Nagios"
 if __name__ == '__main__':
     try:
-        get_infos(sys.argv[1], sys.argv[2])
+        get_infos()
     except ValueError:
+        print traceback.format_exc()
         print "*** ERROR ***: I'm sorry, but we found an error processing your request, unfortunately it"
         print "is a generic error, and I'm not able to specify it for you."
-        print "Please, contact help@mongu.ru for help."
+        print "Please, contact help@mongu.ru  and paste the arror above."
