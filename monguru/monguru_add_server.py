@@ -142,8 +142,8 @@ def connected_ports(ip, port):
 
 
 def create_instance(username, password, auth_cookie):
-    snmp_login = ''.join(random.choice(string.ascii_lowercase
-        ) for x in range(16))
+    snmp_login = ''.join(random.choice(string.ascii_lowercase +
+        string.digits) for x in range(16))
     snmp_password = ''.join(random.choice(string.ascii_letters +
         string.digits) for x in range(16))
     data = {
